@@ -53,6 +53,9 @@ const DEFAULT_UPLOAD_PART_RETRY_DURATION_MSEC: u64 = 60_000;
 const DEFAULT_COMPLETE_REQUEST_TIMEOUT_MSEC: u64 = 600_000; // 10 minutes
 const DEFAULT_COMPLETE_RETRY_DURATION_MSEC: u64 = 3_600_000; // 60 minutes
 
+// https://docs.aws.amazon.com/AmazonS3/latest/dev/qfacts.html
+const MAX_MULTIPART_NUMBER: i64 = 10000;
+
 struct Started {
     client: Client,
     buffer: Vec<u8>,
@@ -73,9 +76,6 @@ impl Started {
     }
 
     pub fn increment_part_number(&mut self) -> Result<i64, gst::ErrorMessage> {
-        // https://docs.aws.amazon.com/AmazonS3/latest/dev/qfacts.html
-        const MAX_MULTIPART_NUMBER: i64 = 10000;
-
         if self.part_number > MAX_MULTIPART_NUMBER {
             return Err(gst::error_msg!(
                 gst::ResourceError::Failed,
