@@ -90,6 +90,417 @@ impl Started {
     }
 }
 
+struct PartInfo {
+    pub buffer: Vec<u8>,
+    pub data_size: usize,
+}
+
+impl PartInfo {
+    fn new(size: usize, capacity: usize) -> PartInfo {
+        PartInfo {
+            buffer: Vec::with_capacity(capacity),
+            data_size: size,
+        }
+    }
+}
+
+struct UploaderPartCache {
+    from_head: bool,
+    max_depth: usize,
+    cache: Vec<PartInfo>,
+}
+
+impl UploaderPartCache {
+    pub fn new(depth: i64) -> UploaderPartCache {
+        UploaderPartCache {
+            from_head: (depth > 0),
+            max_depth: depth.abs().try_into().unwrap(),
+            cache: Default::default(),
+        }
+    }
+
+    pub fn get<T: Into<usize>>(&self, part_num: T) -> Option<&PartInfo> {
+        let part_num = part_num.into() as usize;
+        self.cache.get(part_num - 1)
+    }
+
+    #[allow(unused)]
+    pub fn get_mut<T: Into<usize>>(&mut self, part_num: T) -> Option<&mut PartInfo> {
+        let part_num = part_num.into() as usize;
+        self.cache.get_mut(part_num - 1)
+    }
+
+    /**
+     * Returns the beginning and ending offsets (in bytes) that can be retrieved
+     * from the cache.  This might be a helpful alternative to calling find if
+     * the only interest is if one can expect the find to succeed.
+     */
+    pub fn coverage_limits(&self) -> (u64, u64) {
+        let mut beginning: Option<u64> = None;
+        let mut ending: Option<u64> = None;
+        let mut offset: u64 = 0;
+
+        for record in self.cache.iter() {
+            let offset_after = offset + record.buffer.len() as u64;
+            if record.buffer.len() > 0 {
+                if beginning.is_none() {
+                    beginning = Some(offset);
+                }
+
+                if beginning.is_some() {
+                    ending = Some(offset_after - 1);
+                }
+
+                offset = offset_after;
+            } else if record.data_size > 0 {
+                offset += record.data_size as u64;
+            }
+        }
+        (beginning.unwrap_or(0), ending.unwrap_or(0))
+    }
+
+    pub fn coverage_range(&self) -> std::ops::Range<u64> {
+        let (start, end) = self.coverage_limits();
+        start..end
+    }
+
+    pub fn update_or_append<T: Into<usize>>(&mut self, part_num: T, buffer: &Vec<u8>) -> bool {
+        // confirm the part number makes logical sense: positive, non-zero, less than
+        // the maximum amount permitted by AWS.
+        let part_num = part_num.into() as usize;
+        let max_part: usize = MAX_MULTIPART_NUMBER.try_into().unwrap();
+        let part_idx = part_num - 1;
+        if part_num > max_part || part_num == 0 || part_idx > self.cache.len() {
+            return false;
+        }
+
+        if part_idx == self.cache.len() {
+            // Insert new one
+            // NOTE: will deal with buffer later if necessary
+            self.cache
+                .push(PartInfo::new(buffer.len(), buffer.capacity()));
+        } else {
+            // update data size, at a minimum
+            self.cache[part_idx].data_size = buffer.len();
+        }
+
+        if self.max_depth > 0 {
+            let first: usize;
+            let last: usize;
+
+            if self.from_head {
+                // Keeping up to the first N buffers
+                last = self.max_depth - 1;
+                first = 0;
+            } else {
+                // Keeping the last / most recent N buffers
+                last = self.cache.len();
+                if self.max_depth < last {
+                    let l = last as isize;
+                    let d = self.max_depth as isize;
+                    first = (l - d).try_into().unwrap();
+                } else {
+                    first = 0;
+                }
+            }
+
+            for (i, part) in self.cache.iter_mut().enumerate() {
+                if first <= i && i <= last {
+                    // part is in 'retain' range
+                    if i == part_idx {
+                        // 'buffer' is this part; update it
+                        part.buffer = buffer.to_owned();
+                        part.data_size = buffer.len();
+                    }
+                } else {
+                    // part not in 'retain' range; ensure it's cleared.
+                    part.buffer.clear();
+                }
+            }
+        }
+        return true;
+    }
+
+    #[allow(unused)]
+    pub fn get_copy<T: Into<usize>>(
+        &self,
+        part_num: T,
+        buffer: &mut Vec<u8>,
+        size: &mut usize,
+    ) -> bool {
+        match self.get(part_num) {
+            Some(part) => {
+                *buffer = part.buffer.to_vec();
+                *size = part.data_size;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /**
+     * Find 'offset' within the part cache (or don't).  If found, 'part_num' and 'size' will
+     * be from the cache.  If the buffer was stored per the configuration, then 'buffer' will
+     * be filled with a copy.
+     */
+    pub fn find(&self, offset: u64, part_num: &mut u16) -> Result<&PartInfo, gst::ErrorMessage> {
+        let mut i = 1;
+        let mut start = 0_u64;
+
+        for item in self.cache.iter() {
+            let item_size: u64 = item.data_size.try_into().unwrap();
+            let range = start..start + item_size;
+
+            if range.contains(&offset) {
+                *part_num = i;
+                return Ok(self.get(i).unwrap());
+            }
+            i += 1;
+            start += item_size;
+        }
+        return Err(gst::error_msg!(
+            gst::ResourceError::NotFound,
+            ["Could not find part {i} in cache"]
+        ));
+    }
+}
+
+// Tests for UploaderPartCache
+#[cfg(test)]
+mod tests {
+    use crate::s3sink::multipartsink::UploaderPartCache;
+
+    /**
+     * Test inserts a buffer of length 100
+     */
+    #[test]
+    fn cache_disabled() {
+        const DEPTH: i64 = 0;
+        const SIZE_BUFFER: usize = 100;
+
+        let mut uut = UploaderPartCache::new(DEPTH);
+        let buffer = vec![0; SIZE_BUFFER];
+        let mut part_num: u16 = 0;
+
+        // Nothing stored, so cache availability.
+        let mut limits = uut.coverage_limits();
+        assert_eq!(0, limits.0);
+        assert_eq!(0, limits.1);
+
+        // Insert and 'find' should both be TRUE since we're looking for the
+        // cached buffer that would have offset 50 in it.  The resulting
+        // buffer however is empty, since caching is "disabled".
+        assert_eq!(uut.cache.len(), 0);
+        assert!(uut.update_or_append(1_usize, &buffer));
+        assert_eq!(uut.cache.len(), 1);
+
+        let result = uut.find(SIZE_BUFFER as u64 / 2, &mut part_num).unwrap();
+        assert_eq!(0, result.buffer.len());
+        assert_eq!(SIZE_BUFFER, result.buffer.capacity());
+        assert_eq!(1, part_num);
+
+        // 'get' should work too, same behavior as above since caching
+        // of the contents of the part is disabled.
+        let mut out_buffer = vec![0; SIZE_BUFFER];
+        let mut out_buffer_size: usize = 0;
+        assert!(uut.get_copy(part_num, &mut out_buffer, &mut out_buffer_size));
+        assert_eq!(out_buffer.len(), 0);
+        assert_eq!(SIZE_BUFFER, out_buffer_size);
+
+        // Still nothing actually stored in the cache, so still 0's for
+        // the limits.
+        limits = uut.coverage_limits();
+        assert_eq!(0, limits.0);
+        assert_eq!(0, limits.1);
+    }
+
+    /**
+     * Push 3 100 byte parts and verify 'find' gets
+     * the right parts vs. the offsets.
+     *    Part 1:   0 -  99
+     *    Part 2: 100 - 199
+     *    Part 3: 200 - 299
+     */
+    #[test]
+    fn find_by_offset() {
+        const BUFFER_SIZE: usize = 100;
+        const NUM_PARTS: usize = 3;
+        let mut uut = UploaderPartCache::new(0);
+
+        // Populate the cache
+        for i in 1..NUM_PARTS as usize {
+            assert_eq!(uut.cache.len(), i - 1);
+            assert!(uut.update_or_append(i, &vec![0; BUFFER_SIZE]));
+            assert_eq!(uut.cache.len(), i);
+
+            // coverage offsets should be unchanged; depth is 0 (no cache).
+            let limits = uut.coverage_limits();
+            assert_eq!(0, limits.0);
+            assert_eq!(0, limits.1);
+        }
+
+        // Validate the cache offsets
+        let mut offset_start: u64 = 0;
+        for i in 1..NUM_PARTS as u16 {
+            let mut out_part_num = 0;
+            let offset_end = (offset_start + BUFFER_SIZE as u64) - 1;
+
+            let mut result = uut.find(offset_start, &mut out_part_num);
+            assert!(result.is_ok());
+            assert_eq!(out_part_num, i);
+
+            result = uut.find(offset_end, &mut out_part_num);
+            assert!(result.is_ok());
+            assert_eq!(out_part_num, i);
+
+            offset_start = offset_end + 1;
+        }
+    }
+
+    /**
+     * Test various failure modes for cache misses on insert/update and get
+     */
+    #[test]
+    fn cache_miss() {
+        const BUFFER_SIZE: usize = 100;
+        let mut uut = UploaderPartCache::new(0);
+        let mut out_buffer_size = 0;
+        let mut out_buffer: Vec<u8> = Default::default();
+        let mut out_part_num = 0;
+        let buffer = vec![0; BUFFER_SIZE];
+
+        // Should not be able to find anything; nothing exists yet.
+        assert!(uut.find(20, &mut out_part_num).is_err());
+
+        // Should not be able to get the first part, it hasn't been inserted.
+        assert!(!uut.get_copy(1_u16, &mut out_buffer, &mut out_buffer_size));
+
+        // Size is 0, so inserting part number 2 is invalid; this should fail.
+        assert!(!uut.update_or_append(2_usize, &out_buffer));
+
+        // Should be able to insert part 1
+        assert!(uut.update_or_append(1_usize, &buffer));
+
+        // Should be able to access part 1, but it's buffer should be empty
+        // since it's beyond the depth being retained in the cache.
+        let result = uut.find(BUFFER_SIZE as u64 - 1, &mut out_part_num).unwrap();
+        assert_eq!(result.buffer.len(), 0);
+        assert_eq!(result.data_size, BUFFER_SIZE);
+
+        // Should not be able to find offset 100 since that would be part 2
+        assert!(uut.find(100, &mut out_part_num).is_err());
+    }
+
+    /**
+     * Verify the behavior of retaining the first N parts, remainders are empty.
+     */
+    #[test]
+    fn retain_head() {
+        const BUFFER_SIZE: usize = 100;
+        let mut uut = UploaderPartCache::new(2);
+        let in_buffer = vec![0; BUFFER_SIZE];
+        let mut out_buffer: Vec<u8> = Default::default();
+        let mut out_buffer_size: usize = 0;
+
+        assert_eq!(uut.cache.len(), 0);
+
+        for i in 1..=uut.max_depth + 1 {
+            let mut temp: Vec<u8> = Default::default();
+            let mut temp_size = 0 as usize;
+
+            assert!(uut.update_or_append(i, &in_buffer));
+
+            // Since this is head retention, immediately upon insertion
+            // if the part number is within the limit, it should be kept,
+            // otherwise immediately dropped.
+            assert!(uut.get_copy(i, &mut temp, &mut temp_size));
+            if i <= uut.max_depth {
+                // Retained
+                assert!(temp.len() != 0);
+                assert!(temp_size == BUFFER_SIZE);
+            } else {
+                // Dropped
+                assert!(temp.len() == 0);
+                assert!(temp_size == BUFFER_SIZE);
+            }
+        }
+        // There should be 3 parts in the cache (though only 2 are retained).
+        assert_eq!(uut.cache.len(), 3);
+
+        // Coverage offsets should be 0 to BUFFER_SIZE*2 - 1 (the end of
+        // buffer 2).
+        let offsets = uut.coverage_limits();
+        assert_eq!(0, offsets.0);
+        assert_eq!((BUFFER_SIZE as u64) * 2 - 1, offsets.1);
+
+        // 1 and 2 should have a buffer, 3 should not.
+        assert!(uut.get_copy(1_u16, &mut out_buffer, &mut out_buffer_size));
+        assert!(out_buffer.len() == BUFFER_SIZE);
+        assert!(out_buffer_size == BUFFER_SIZE);
+        out_buffer.clear();
+        out_buffer_size = 0;
+
+        assert!(uut.get_copy(2_u16, &mut out_buffer, &mut out_buffer_size));
+        assert!(out_buffer.len() == BUFFER_SIZE);
+        assert!(out_buffer_size == BUFFER_SIZE);
+        out_buffer.clear();
+        out_buffer_size = 0;
+
+        assert!(uut.get_copy(3_u16, &mut out_buffer, &mut out_buffer_size));
+        assert!(out_buffer.len() == 0);
+        assert!(out_buffer_size == BUFFER_SIZE);
+    }
+
+    /**
+     * Verify the behavior of retaining the last N parts, remainders are empty.
+     */
+    #[test]
+    fn retain_tail() {
+        const BUFFER_SIZE: usize = 100;
+        let mut uut = UploaderPartCache::new(-2);
+        let in_buffer = vec![0; BUFFER_SIZE];
+        let mut out_buffer: Vec<u8> = Default::default();
+        let mut out_buffer_size = 0;
+
+        assert_eq!(uut.cache.len(), 0);
+        for i in 1..=uut.max_depth + 1 {
+            let mut temp: Vec<u8> = Default::default();
+            let mut temp_size = 0 as usize;
+
+            assert!(uut.update_or_append(i, &in_buffer));
+
+            // Since this is tail retention, the most recent part should
+            // always be retained.
+            assert!(uut.get_copy(i, &mut temp, &mut temp_size));
+            assert!(temp.len() != 0);
+            assert!(temp_size == BUFFER_SIZE);
+        }
+
+        // 1 should not have a buffer, 2 and 3 should.
+        assert!(uut.get_copy(1_usize, &mut out_buffer, &mut out_buffer_size));
+        assert!(out_buffer.len() == 0);
+        assert!(out_buffer_size == BUFFER_SIZE);
+        out_buffer.clear();
+        out_buffer_size = 0;
+
+        assert!(uut.get_copy(2_usize, &mut out_buffer, &mut out_buffer_size));
+        assert!(out_buffer.len() == BUFFER_SIZE);
+        assert!(out_buffer_size == BUFFER_SIZE);
+        out_buffer.clear();
+        out_buffer_size = 0;
+
+        assert!(uut.get_copy(3_usize, &mut out_buffer, &mut out_buffer_size));
+        assert!(out_buffer.len() == BUFFER_SIZE);
+        assert!(out_buffer_size == BUFFER_SIZE);
+
+        // Coverage offsets should be BUFFER_SIZE to BUFFER_SIZE*3 - 1 (the end of
+        // buffer 2).
+        let offsets = uut.coverage_limits();
+        assert_eq!(BUFFER_SIZE as u64, offsets.0);
+        assert_eq!((BUFFER_SIZE as u64) * 3 - 1, offsets.1);
+    }
+}
+
 #[derive(Default)]
 enum State {
     #[default]
