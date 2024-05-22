@@ -39,7 +39,6 @@ use super::OnError;
 
 const DEFAULT_FORCE_PATH_STYLE: bool = false;
 const DEFAULT_RETRY_ATTEMPTS: u32 = 5;
-const DEFAULT_BUFFER_SIZE: u64 = 5 * 1024 * 1024;
 const DEFAULT_MULTIPART_UPLOAD_ON_ERROR: OnError = OnError::DoNothing;
 
 // General setting for create / abort requests
@@ -105,7 +104,7 @@ struct Settings {
     key: Option<String>,
     content_type: Option<String>,
     content_disposition: Option<String>,
-    buffer_size: u64,
+    buffer_size: usize,
     access_key: Option<String>,
     secret_access_key: Option<String>,
     session_token: Option<String>,
@@ -164,7 +163,7 @@ impl Default for Settings {
             secret_access_key: None,
             session_token: None,
             metadata: None,
-            buffer_size: DEFAULT_BUFFER_SIZE,
+            buffer_size: 0,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             multipart_upload_on_error: DEFAULT_MULTIPART_UPLOAD_ON_ERROR,
             request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MSEC),
@@ -655,6 +654,16 @@ impl ObjectImpl for S3Sink {
 
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
+            // AWS min/max is 5 MB -> 5GB
+            // Rust Vec, used in this module, has a maximum size of usize, which is
+            // tied to the system architecture.  Per this, all tier 1 architectures
+            // are 32 or 64-bit, so the 5 MB minimum is no big deal:
+            //     https://doc.rust-lang.org/nightly/rustc/platform-support.html
+            //
+            // However the 5 GB max would exceed 32-bit architectures.
+            let min_buffer_size: u64 = 5 * 1024_u64.pow(2);
+            let max_buffer_size: u64 = std::cmp::min(std::usize::MAX as u64, 5 * 1024_u64.pow(3));
+            let default_buffer_size: u64 = min_buffer_size;
             vec![
                 glib::ParamSpecString::builder("bucket")
                     .nick("S3 Bucket")
@@ -675,9 +684,10 @@ impl ObjectImpl for S3Sink {
                 glib::ParamSpecUInt64::builder("part-size")
                     .nick("Part size")
                     .blurb("A size (in bytes) of an individual part used for multipart upload.")
-                    .minimum(5 * 1024 * 1024)        // 5 MB
-                    .maximum(5 * 1024 * 1024 * 1024) // 5 GB
-                    .default_value(DEFAULT_BUFFER_SIZE)
+                    .minimum(min_buffer_size)
+                    .maximum(max_buffer_size)
+                    .default_value(default_buffer_size)
+                    .construct()
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("uri")
@@ -812,7 +822,7 @@ impl ObjectImpl for S3Sink {
                 }
             }
             "part-size" => {
-                settings.buffer_size = value.get::<u64>().expect("type checked upstream");
+                settings.buffer_size = value.get::<u64>().expect("type checked upstream").try_into().unwrap();
             }
             "uri" => {
                 let _ = self.set_uri(value.get().expect("type checked upstream"));
@@ -897,7 +907,7 @@ impl ObjectImpl for S3Sink {
             "key" => settings.key.to_value(),
             "bucket" => settings.bucket.to_value(),
             "region" => settings.region.to_string().to_value(),
-            "part-size" => settings.buffer_size.to_value(),
+            "part-size" => (settings.buffer_size as u64).to_value(),
             "uri" => {
                 let url = self.url.lock().unwrap();
                 let url = match *url {
