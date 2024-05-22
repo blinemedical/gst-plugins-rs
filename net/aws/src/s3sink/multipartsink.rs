@@ -38,6 +38,7 @@ use super::OnError;
 
 const DEFAULT_FORCE_PATH_STYLE: bool = false;
 const DEFAULT_RETRY_ATTEMPTS: u32 = 5;
+const DEFAULT_NUM_CACHED_PARTS: i64 = 0;
 const DEFAULT_MULTIPART_UPLOAD_ON_ERROR: OnError = OnError::DoNothing;
 
 // General setting for create / abort requests
@@ -60,16 +61,23 @@ struct Started {
     upload_id: String,
     part_number: i64, // the active part number
     completed_parts: Vec<CompletedPart>,
+    cache: UploaderPartCache,
 }
 
 impl Started {
-    pub fn new(client: Client, buffer: Vec<u8>, upload_id: String) -> Started {
+    pub fn new(
+        client: Client,
+        buffer: Vec<u8>,
+        upload_id: String,
+        num_cache_parts: i64,
+    ) -> Started {
         Started {
             client,
             buffer,
             upload_id,
             part_number: 1,
             completed_parts: Vec::new(),
+            cache: UploaderPartCache::new(num_cache_parts),
         }
     }
 
@@ -518,6 +526,7 @@ struct Settings {
     content_encoding: Option<String>,
     content_language: Option<String>,
     buffer_size: usize,
+    num_cached_parts: i64,
     access_key: Option<String>,
     secret_access_key: Option<String>,
     session_token: Option<String>,
@@ -580,6 +589,7 @@ impl Default for Settings {
             session_token: None,
             metadata: None,
             buffer_size: 0,
+            num_cached_parts: DEFAULT_NUM_CACHED_PARTS,
             retry_attempts: DEFAULT_RETRY_ATTEMPTS,
             multipart_upload_on_error: DEFAULT_MULTIPART_UPLOAD_ON_ERROR,
             request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MSEC),
@@ -988,6 +998,7 @@ impl S3Sink {
             client,
             Vec::with_capacity(settings.buffer_size as usize),
             upload_id,
+            settings.num_cached_parts,
         ));
 
         Ok(())
@@ -1110,6 +1121,14 @@ impl ObjectImpl for S3Sink {
                     .maximum(max_buffer_size)
                     .default_value(default_buffer_size)
                     .construct()
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecInt64::builder("num-cached-parts")
+                    .nick("Number of parts to cache (seeking)")
+                    .blurb("Number of parts to cache to enable seeking before the multipart upload completes")
+                    .minimum(-1 * MAX_MULTIPART_NUMBER)
+                    .maximum(MAX_MULTIPART_NUMBER)
+                    .default_value(DEFAULT_NUM_CACHED_PARTS)
                     .mutable_ready()
                     .build(),
                 glib::ParamSpecString::builder("uri")
@@ -1258,6 +1277,9 @@ impl ObjectImpl for S3Sink {
             "part-size" => {
                 settings.buffer_size = value.get::<u64>().expect("type checked upstream").try_into().unwrap();
             }
+            "num-cached-parts" => {
+                settings.num_cached_parts = value.get::<i64>().expect("type checked upstream");
+            }
             "uri" => {
                 let _ = self.set_uri(value.get().expect("type checked upstream"));
             }
@@ -1357,6 +1379,7 @@ impl ObjectImpl for S3Sink {
             "bucket" => settings.bucket.to_value(),
             "region" => settings.region.to_string().to_value(),
             "part-size" => (settings.buffer_size as u64).to_value(),
+            "num-cached-parts" => settings.num_cached_parts.to_value(),
             "uri" => {
                 let url = self.url.lock().unwrap();
                 let url = match *url {
