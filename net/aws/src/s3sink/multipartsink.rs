@@ -57,9 +57,9 @@ const MAX_MULTIPART_NUMBER: i64 = 10000;
 
 struct Started {
     client: Client,
-    buffer: Vec<u8>,
+    buffer: Vec<u8>,  // the active part's buffer
     upload_id: String,
-    part_number: i64,
+    part_number: i64, // the active part number
     completed_parts: Vec<CompletedPart>,
 }
 
@@ -69,7 +69,7 @@ impl Started {
             client,
             buffer,
             upload_id,
-            part_number: 0,
+            part_number: 1,
             completed_parts: Vec::new(),
         }
     }
@@ -258,8 +258,6 @@ impl S3Sink {
             }
         };
 
-        let part_number = state.part_number;
-
         let upload_part_req_future = upload_part_req.send();
         let output =
             s3utils::wait(&self.canceller, upload_part_req_future).map_err(|err| match err {
@@ -275,11 +273,14 @@ impl S3Sink {
 
         let completed_part = CompletedPart::builder()
             .set_e_tag(output.e_tag)
-            .set_part_number(Some(part_number as i32))
+            .set_part_number(Some(state.part_number as i32))
             .build();
         state.completed_parts.push(completed_part);
 
-        gst::info!(CAT, imp: self, "Uploaded part {}", part_number);
+        gst::info!(CAT, imp: self, "Uploaded part {}", state.part_number);
+
+        // Increment part number
+        state.increment_part_number()?;
 
         Ok(())
     }
@@ -298,7 +299,6 @@ impl S3Sink {
             }
         };
 
-        let part_number = state.increment_part_number()?;
         let body = Some(ByteStream::from(std::mem::replace(
             &mut state.buffer,
             Vec::with_capacity(settings.buffer_size as usize),
@@ -315,7 +315,7 @@ impl S3Sink {
             .set_bucket(bucket)
             .set_key(key)
             .set_upload_id(upload_id)
-            .set_part_number(Some(part_number as i32));
+            .set_part_number(Some(state.part_number as i32));
 
         Ok(upload_part)
     }
