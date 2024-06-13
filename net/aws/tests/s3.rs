@@ -202,6 +202,54 @@ mod tests {
 
     #[ignore = "failing, needs investigation"]
     #[tokio::test]
+    async fn test_s3_multipart_query_position() {
+        // Verfies that the basesink::query handler is correctly handling Bytes -formatted
+        // position queries according to the current position in the overall upload.
+        init();
+
+        let (region, bucket, key) = get_env_args("query-position");
+        let uri = get_uri(&region, &bucket, &key);
+
+        let mut h1 = gst_check::Harness::new_parse(&format!(
+            "awss3sink name=\"sink\" uri=\"{uri}\" num-cached-parts=1"
+        ));
+        let h1el = h1
+            .element()
+            .unwrap()
+            .dynamic_cast::<gst::Bin>()
+            .unwrap()
+            .by_name("sink")
+            .unwrap();
+        let part_size = h1el.property::<u64>("part-size");
+        let pad = h1el.static_pad("sink").unwrap();
+
+        // Start.
+        h1.play();
+
+        // Position should be 0 on start
+        let mut position = pad.query_position::<gst::format::Bytes>();
+        assert_eq!(0, u64::from(position.unwrap()));
+
+        // Push stream start, segment, and 3 buffers
+        let segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        h1.push_event(gst::event::StreamStart::builder(&"test-stream").build());
+        h1.push_event(gst::event::Segment::new(&segment));
+        for i in 1..=3 as u8 {
+            let buffer = make_buffer(&vec![i; part_size.try_into().unwrap()]);
+            h1.push(buffer).unwrap();
+
+            // Verify position is updating
+            position = pad.query_position::<gst::format::Bytes>();
+            assert_eq!(part_size * (i as u64), u64::from(position.unwrap()));
+        }
+
+        // Finish and clean up.
+        h1.push_event(gst::event::Eos::new());
+        delete_object(region.clone(), &bucket, &key).await;
+    }
+
+    #[ignore = "failing, needs investigation"]
+    #[tokio::test]
     async fn test_s3_put_object_simple() {
         do_s3_putobject_test("s3-put-object-test", None, None, None, true).await;
     }

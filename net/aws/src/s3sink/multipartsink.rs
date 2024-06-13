@@ -63,6 +63,10 @@ struct Started {
     part_number: i64, // the active part number
     completed_parts: Vec<CompletedPart>,
     cache: UploaderPartCache,
+    // The overall upload's current write head position.
+    // Given the AWS limits of 5GB part size and 10k parts, this is:
+    //   (5*1024^3) * 10,000 = 53,687,091,200,000, a 64-bit number.
+    upload_pos: u64,
 }
 
 impl Started {
@@ -79,6 +83,7 @@ impl Started {
             part_number: 1,
             completed_parts: Vec::new(),
             cache: UploaderPartCache::new(num_cache_parts),
+            upload_pos: 0,
         }
     }
 
@@ -719,6 +724,9 @@ impl S3Sink {
                 unreachable!("Element should be started");
             }
         };
+
+        // Update the position within the upload
+        state.upload_pos += state.buffer.len() as u64;
 
         let body = Some(ByteStream::from(std::mem::replace(
             &mut state.buffer,
@@ -1504,6 +1512,30 @@ impl BaseSinkImpl for S3Sink {
         *canceller = s3utils::Canceller::None;
         *abort_canceller = s3utils::Canceller::None;
         Ok(())
+    }
+
+    fn query(&self, query: &mut gst::QueryRef) -> bool {
+        match query.view_mut() {
+            gst::QueryViewMut::Formats(fmt) => {
+                fmt.set(&vec![gst::Format::Bytes]);
+                true
+            }
+            gst::QueryViewMut::Position(pos) => {
+                if pos.format() == gst::Format::Bytes {
+                    let mut state = self.state.lock().unwrap();
+                    match *state {
+                        State::Started(ref mut started_state) => {
+                            pos.set(gst::format::Bytes::from_u64(started_state.upload_pos));
+                            true
+                        }
+                        _ => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => BaseSinkImplExt::parent_query(self, query),
+        }
     }
 
     fn event(&self, event: gst::Event) -> bool {
