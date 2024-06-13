@@ -194,6 +194,285 @@ mod tests {
         do_s3_multipart_test("s3 test").await;
     }
 
+    /**
+     * This test will run the sink with 1 part cached at the head (start)
+     * of the upload.  It will push 12 packets (just over 2 parts), seek to
+     * a few bytes into the first part, write a change, then EOS.  The
+     * expected result is the seek to use the cache, and the EOS to push the
+     * cached buffer and complete the upload.
+     */
+    #[ignore = "failing, needs investigation"]
+    #[tokio::test]
+    async fn test_s3_multipart_head_cached() {
+        init();
+
+        let (region, bucket, key) = get_env_args("head_cached");
+        let uri = get_uri(&region, &bucket, &key);
+        let buffer_size = 1024 * 1024;
+        let buffers_per_part = 5;
+        let part_size = buffer_size * buffers_per_part;
+        let num_buffers = 12;
+
+        let mut h1 = gst_check::Harness::new_parse(&format!(
+            "awss3sink name=\"sink\" uri=\"{uri}\" num-cached-parts=1 part-size={part_size}"
+        ));
+        h1.set_src_caps(gst::Caps::builder("text/plain").build());
+        h1.play();
+
+        // Push stream start, segment, and buffers
+        let mut segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        h1.push_event(gst::event::StreamStart::builder(&"test-stream").build());
+        h1.push_event(gst::event::Segment::new(&segment));
+        for i in 1..=num_buffers as u8 {
+            let buffer = make_buffer(&vec![i; buffer_size]);
+            h1.push(buffer).unwrap();
+        }
+
+        // Try to seek into part 1 (end of first packet).
+        segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        segment.set_start(gst::format::Bytes::from_u64(
+            buffer_size.try_into().unwrap(),
+        ));
+        assert!(h1.push_event(gst::event::Segment::new(&segment)));
+
+        // Overwrite second packet of part 1: [01...][AA...][03...]...
+        // This should succeed.
+        h1.push(make_buffer(&vec![0xAA; buffer_size])).unwrap();
+
+        // EOS to finish the upload
+        h1.push_event(gst::event::Eos::new());
+
+        // FIXME: This seems to return too early -- before the file is finalized
+        // at S3 -- because the h2.play() occasionally fails on GstState change
+        // to playing because the file is not found.
+
+        //  Download and verify contents
+        let mut h2 = gst_check::Harness::new("awss3src");
+        h2.element().unwrap().set_property("uri", uri.clone());
+        h2.play();
+
+        let mut location: usize = 0;
+        let mut expect = 0x00_u8;
+        loop {
+            match h2.pull() {
+                Ok(temp) => {
+                    let buffer = temp.into_mapped_buffer_readable().unwrap();
+
+                    if 0 == location % buffer_size {
+                        expect += 1;
+                    }
+
+                    for b in buffer.as_slice() {
+                        if buffer_size <= location && location < 2 * buffer_size {
+                            assert_eq!(b, &0xAA_u8);
+                        } else {
+                            assert_eq!(b, &expect);
+                        }
+                        location += 1;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(location, num_buffers * buffer_size);
+
+        delete_object(region.clone(), &bucket, &key).await;
+    }
+
+    /**
+     * Pulls all buffers via harness.pull() until the 60-second timeout occurs,
+     * causing this method to return a buffer containing all of the others.
+     */
+    fn pull_all_buffers_as_slice(harness: &mut gst_check::Harness) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+
+        loop {
+            match harness.pull() {
+                Ok(temp) => {
+                    let buffer = temp.into_mapped_buffer_readable().unwrap();
+                    out.extend(buffer.as_slice());
+                }
+                Err(_) => break,
+            }
+        }
+
+        out
+    }
+
+    /**
+     * This test verifies that a seek within the current part is permitted.
+     * Since the cache is not involved, subsequent writes beyond the previous "end" of
+     * of the buffer will simply continue as normal.
+     */
+    #[ignore = "failing, needs investigation"]
+    #[tokio::test]
+    async fn test_s3_multipart_permit_seek_in_active_part() {
+        init();
+
+        let (region, bucket, key) = get_env_args("seek_active_part");
+        let uri = get_uri(&region, &bucket, &key);
+        let buffer_size = 1024 * 1024;
+        let buffers_per_part = 5;
+        let part_size = buffer_size * buffers_per_part;
+        let num_buffers = 2;
+
+        let mut h1 = gst_check::Harness::new_parse(&format!(
+            "awss3sink name=\"sink\" uri=\"{uri}\" num-cached-parts=1 part-size={part_size}"
+        ));
+        h1.set_src_caps(gst::Caps::builder("text/plain").build());
+        h1.play();
+
+        // Push stream start, segment, and buffers
+        let mut segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        h1.push_event(gst::event::StreamStart::builder(&"test-stream").build());
+        h1.push_event(gst::event::Segment::new(&segment));
+        for i in 1..=num_buffers as u8 {
+            let buffer = make_buffer(&vec![i; buffer_size]);
+            h1.push(buffer).unwrap();
+        }
+
+        // Seek back to the start of the second buffer, which is still the active part.
+        segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        segment.set_start(gst::format::Bytes::from_u64(
+            buffer_size.try_into().unwrap(),
+        ));
+        assert!(h1.push_event(gst::event::Segment::new(&segment)));
+
+        // Overwrite that buffer, which should succeed.
+        // This should succeed.
+        h1.push(make_buffer(&vec![0xAA; buffer_size])).unwrap();
+
+        // EOS to finish the upload
+        h1.push_event(gst::event::Eos::new());
+
+        // Verify
+        let mut h2 = gst_check::Harness::new("awss3src");
+        h2.element().unwrap().set_property("uri", uri.clone());
+        h2.play();
+
+        let buffer = pull_all_buffers_as_slice(&mut h2);
+        assert_eq!(buffer.len(), buffer_size * 2);
+        assert!(buffer[0..(buffer_size - 1)].iter().all(|&b| b == 0x01_u8));
+        assert!(buffer[buffer_size..].iter().all(|&b| b == 0xAA_u8));
+
+        delete_object(region.clone(), &bucket, &key).await;
+    }
+
+    /**
+     * This test verifies the behavior where a seek back into the cache is successful,
+     * but the continued write goes off the edge of the cache.  Since this implementation
+     * does not attempt to do any download/re-upload of previous parts, the expected result
+     * is a flow error when the boundary is crossed.
+     *
+     * The test configures 1 part head cache, writes two parts, seeks into the tail of the
+     * first part and writes a buffer that would cross the part boundary (cache miss).
+     * The expected result is a flow error.
+     */
+    #[ignore = "failing, needs investigation"]
+    #[tokio::test]
+    async fn test_s3_multipart_cache_miss_on_write() {
+        init();
+
+        let (region, bucket, key) = get_env_args("cache_miss_on_write");
+        let uri = get_uri(&region, &bucket, &key);
+        let buffer_size = 1024 * 1024;
+        let buffers_per_part = 5;
+        let part_size = buffer_size * buffers_per_part;
+        let num_buffers = 6;
+
+        let mut h1 = gst_check::Harness::new_parse(&format!(
+            "awss3sink name=\"sink\" uri=\"{uri}\" num-cached-parts=1 part-size={part_size}"
+        ));
+        h1.set_src_caps(gst::Caps::builder("text/plain").build());
+        h1.play();
+
+        // Push stream start, segment, and buffers
+        let mut segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        h1.push_event(gst::event::StreamStart::builder(&"test-stream").build());
+        h1.push_event(gst::event::Segment::new(&segment));
+        for i in 1..=num_buffers as u8 {
+            let buffer = make_buffer(&vec![i; buffer_size]);
+            h1.push(buffer).unwrap();
+        }
+
+        // Seek to near the end of part 1 (half a buffer from tail)
+        segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        segment.set_start(gst::format::Bytes::from_u64(
+            (part_size - (buffer_size / 2)).try_into().unwrap(),
+        ));
+        assert!(h1.push_event(gst::event::Segment::new(&segment)));
+
+        // Write a full buffer.  The first half of the write will succeed internally but the continued
+        // write will trigger a flow error response since the cache boundary will be crossed.
+        assert!(h1.push(make_buffer(&vec![0xAA; buffer_size])).is_err());
+    }
+
+    /**
+     * This test caches the first part.  Two parts are written, then a seek into the tail of
+     * the first part.  The subsequent write reaches the end of part 1, flagging a potential
+     * cache miss is imminent if more data is written.  However, an EOS event is received
+     * which successfully finalizes the file and does not result in a flow error.
+     */
+    #[ignore = "failing, needs investigation"]
+    #[tokio::test]
+    async fn test_s3_multipart_eos_on_cache_boundary() {
+        init();
+
+        let (region, bucket, key) = get_env_args("eos_on_cache_boundary");
+        let uri = get_uri(&region, &bucket, &key);
+        let buffer_size = 1024 * 1024;
+        let buffers_per_part = 5;
+        let part_size = buffer_size * buffers_per_part;
+        let num_buffers = 6;
+
+        let mut h1 = gst_check::Harness::new_parse(&format!(
+            "awss3sink name=\"sink\" uri=\"{uri}\" num-cached-parts=1 part-size={part_size}"
+        ));
+        h1.set_src_caps(gst::Caps::builder("text/plain").build());
+        h1.play();
+
+        // Push stream start, segment, and buffers
+        let mut segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        h1.push_event(gst::event::StreamStart::builder(&"test-stream").build());
+        h1.push_event(gst::event::Segment::new(&segment));
+        for i in 1..=num_buffers as u8 {
+            let buffer = make_buffer(&vec![i; buffer_size]);
+            h1.push(buffer).unwrap();
+        }
+
+        // Seek to the end of part 1 (a buffer from tail)
+        segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        segment.set_start(gst::format::Bytes::from_u64(
+            (part_size - buffer_size).try_into().unwrap(),
+        ));
+        assert!(h1.push_event(gst::event::Segment::new(&segment)));
+
+        // Write a full buffer.  The write should succeed because it only reaches the cache boundary.
+        assert!(h1.push(make_buffer(&vec![0xAA; buffer_size])).is_ok());
+
+        // EOS should be allowed and result in a finalized file.
+        h1.push_event(gst::event::Eos::new());
+
+        // Verify
+        let mut h2 = gst_check::Harness::new("awss3src");
+        h2.element().unwrap().set_property("uri", uri.clone());
+        h2.play();
+
+        let buffer = pull_all_buffers_as_slice(&mut h2);
+        assert_eq!(buffer.len(), buffer_size * num_buffers);
+        assert!(buffer[buffer_size * 3..(buffer_size * 4 - 1)]
+            .iter()
+            .all(|&b| b == 0x04_u8));
+        assert!(buffer[buffer_size * 4..(buffer_size * 5 - 1)]
+            .iter()
+            .all(|&b| b == 0xAA_u8));
+        assert!(buffer[buffer_size * 5..(buffer_size * 6 - 1)]
+            .iter()
+            .all(|&b| b == 0x06_u8));
+
+        delete_object(region.clone(), &bucket, &key).await;
+    }
+
     #[ignore = "failing, needs investigation"]
     #[tokio::test]
     async fn test_s3_multipart_unicode() {
@@ -248,7 +527,8 @@ mod tests {
         delete_object(region.clone(), &bucket, &key).await;
     }
 
-    #[ignore = "failing, needs investigation"]
+    #[test_with::env(AWS_ACCESS_KEY_ID)]
+    #[test_with::env(AWS_SECRET_ACCESS_KEY)]
     #[tokio::test]
     async fn test_s3_multipart_query_seeking() {
         // Verfies the basesink::query handler is providing correct replies to Bytes -formatted
@@ -286,7 +566,8 @@ mod tests {
         assert_eq!(u64::MAX - 1, upper.value() as u64);
     }
 
-    #[ignore = "failing, needs investigation"]
+    #[test_with::env(AWS_ACCESS_KEY_ID)]
+    #[test_with::env(AWS_SECRET_ACCESS_KEY)]
     #[tokio::test]
     async fn test_s3_put_object_simple() {
         do_s3_putobject_test("s3-put-object-test", None, None, None, true).await;
