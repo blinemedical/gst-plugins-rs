@@ -55,15 +55,24 @@ mod tests {
             .unwrap();
     }
 
-    // Common helper
-    async fn do_s3_multipart_test(key_prefix: &str) {
-        init();
-
+    fn get_env_args(key_prefix: &str) -> (String, String, String) {
         let region = std::env::var("AWS_REGION").unwrap_or_else(|_| DEFAULT_S3_REGION.to_string());
         let bucket =
             std::env::var("AWS_S3_BUCKET").unwrap_or_else(|_| "gst-plugins-rs-tests".to_string());
         let key = format!("{key_prefix}-{:?}.txt", chrono::Utc::now());
-        let uri = format!("s3://{region}/{bucket}/{key}");
+        (region, bucket, key)
+    }
+
+    fn get_uri(region: &str, bucket: &str, key: &str) -> String {
+        format!("s3://{region}/{bucket}/{key}")
+    }
+
+    // Common helper
+    async fn do_s3_multipart_test(key_prefix: &str) {
+        init();
+
+        let (region, bucket, key) = get_env_args(key_prefix);
+        let uri = get_uri(&region, &bucket, &key);
         let content = "Hello, world!\n".as_bytes();
 
         // Manually add the element so we can configure it before it goes to PLAYING
