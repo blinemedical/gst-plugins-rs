@@ -58,7 +58,12 @@ const MAX_MULTIPART_NUMBER: i64 = 10000;
 
 struct Started {
     client: Client,
-    buffer: Vec<u8>,  // the active part's buffer
+    // the active part's buffer
+    buffer: Vec<u8>,
+    // active buffer's "data size" represents the last offset of
+    // data that was written to the buffer prior to manually setting
+    // the buffer's len() during a seek operation.
+    buffer_data_size: usize,
     upload_id: String,
     part_number: i64, // the active part number
     completed_parts: Vec<CompletedPart>,
@@ -79,6 +84,7 @@ impl Started {
         Started {
             client,
             buffer,
+            buffer_data_size: 0,
             upload_id,
             part_number: 1,
             completed_parts: Vec::new(),
@@ -606,6 +612,8 @@ pub struct S3Sink {
     state: Mutex<State>,
     canceller: Mutex<s3utils::Canceller>,
     abort_multipart_canceller: Mutex<s3utils::Canceller>,
+    eos_pending: Mutex<bool>,
+    write_will_cache_miss: Mutex<bool>,
 }
 
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
@@ -670,8 +678,18 @@ impl S3Sink {
         }
     }
 
+    /**
+     * Creates a part upload request using the current buffer (clearing it)
+     * and then sending the request (thus uploading the buffer).  Upon
+     * successful completion, the completed part information is added to
+     * the state.
+     */
     fn flush_current_buffer(&self) -> Result<(), Option<gst::ErrorMessage>> {
         let upload_part_req = self.create_upload_part_request()?;
+
+        if upload_part_req.is_none() {
+            return Ok(()); // nothing to do here.
+        }
 
         let mut state = self.state.lock().unwrap();
         let state = match *state {
@@ -684,7 +702,7 @@ impl S3Sink {
             }
         };
 
-        let upload_part_req_future = upload_part_req.send();
+        let upload_part_req_future = upload_part_req.unwrap().send();
         let output =
             s3utils::wait(&self.canceller, upload_part_req_future).map_err(|err| match err {
                 WaitError::FutureError(err) => {
@@ -701,19 +719,69 @@ impl S3Sink {
             .set_e_tag(output.e_tag)
             .set_part_number(Some(state.part_number as i32))
             .build();
-        state.completed_parts.push(completed_part);
+
+        // Update or replace the completed part
+        match state
+            .completed_parts
+            .get_mut((state.part_number - 1) as usize)
+        {
+            Some(part) => *part = completed_part,
+            None => state.completed_parts.push(completed_part),
+        }
+
+        // state.buffer_data_size is still set to the length of this most recently uploaded
+        // buffer, so increment the global write head position (upload_pos) with it.
+        state.upload_pos += state.buffer_data_size as u64;
 
         gst::info!(CAT, imp: self, "Uploaded part {}", state.part_number);
 
         // Increment part number
         state.increment_part_number()?;
 
-        Ok(())
+        // There are a few cases to check:
+        // 1. OK: N/A -> "new" part that will append the upload
+        // 2. OK: cache -> cached part
+        // 3. ERR: cache -> "new" part that will NOT append the upload (cache miss)
+        //
+        // If the cache.get() returns a record:
+        //   1. This current part number will NOT be appending the upload.
+        //   2. If the buffer is empty, it is a cache miss.
+        // Check if this part should come from cache
+        let eos_pending = self.eos_pending.lock().unwrap();
+        match state.cache.get(state.part_number as usize) {
+            Some(part) => {
+                if part.buffer.is_empty() {
+                    if false == *eos_pending {
+                        // Cache miss (case 3) -- the part number was known but the buffer
+                        // was not stored in the cache (because of the cache configuration).
+                        *self.write_will_cache_miss.lock().unwrap() = true;
+                        state.buffer_data_size = 0;
+                        gst::debug!(CAT, imp:self, "Next write will cause a cache miss unless another seek is performed.");
+                    }
+                } else {
+                    // Cache hit (case 2) -- the part number was known and the buffer
+                    // was a part of the cache
+                    state.buffer = part.buffer.to_owned();
+                    state.buffer_data_size = part.data_size;
+                }
+                Ok(())
+            }
+            None => {
+                // case 1
+                state.buffer_data_size = 0;
+                Ok(())
+            }
+        }
     }
 
-    fn create_upload_part_request(&self) -> Result<UploadPartFluentBuilder, gst::ErrorMessage> {
+    /**
+     * Creates the part upload request, moving the active buffer's contents
+     * into the request and then resetting the buffer.
+     */
+    fn create_upload_part_request(
+        &self,
+    ) -> Result<Option<UploadPartFluentBuilder>, gst::ErrorMessage> {
         let url = self.url.lock().unwrap();
-        let settings = self.settings.lock().unwrap();
         let mut state = self.state.lock().unwrap();
         let state = match *state {
             State::Started(ref mut started_state) => started_state,
@@ -725,12 +793,28 @@ impl S3Sink {
             }
         };
 
-        // Update the position within the upload
-        state.upload_pos += state.buffer.len() as u64;
+        if state.buffer_data_size == 0 {
+            // Nothing to upload.
+            return Ok(None);
+        }
 
+        // Update buffer len() to buffer_data_size, in the event the two
+        // became out of sync because of seeking.  This ensures that the
+        // data size is stored correctly in the cache and copied fully
+        // into the request body.
+        unsafe {
+            state.buffer.set_len(state.buffer_data_size);
+        }
+
+        // Update/append the part cache
+        state
+            .cache
+            .update_or_append(state.part_number as usize, &state.buffer);
+
+        let capacity = state.buffer.capacity();
         let body = Some(ByteStream::from(std::mem::replace(
             &mut state.buffer,
-            Vec::with_capacity(settings.buffer_size as usize),
+            Vec::with_capacity(capacity),
         )));
 
         let bucket = Some(url.as_ref().unwrap().bucket.to_owned());
@@ -746,7 +830,7 @@ impl S3Sink {
             .set_upload_id(upload_id)
             .set_part_number(Some(state.part_number as i32));
 
-        Ok(upload_part)
+        Ok(Some(upload_part))
     }
 
     fn create_complete_multipart_upload_request(
@@ -1001,6 +1085,11 @@ impl S3Sink {
         Ok(())
     }
 
+    /**
+     * Add 'src' to the buffer.  If this exceeds the capacity of the buffer
+     * (i.e., the configured AWS max part size), the buffer is flushed (uploaded)
+     * and the remaining portion of src starts the next buffer (part).
+     */
     fn update_buffer(&self, src: &[u8]) -> Result<(), Option<gst::ErrorMessage>> {
         let mut state = self.state.lock().unwrap();
         let started_state = match *state {
@@ -1018,8 +1107,18 @@ impl S3Sink {
             src.len(),
         );
 
+        if *self.write_will_cache_miss.lock().unwrap() && to_copy > 0 {
+            return Err(Some(gst::error_msg!(
+                gst::ResourceError::NotFound,
+                ["Cache miss on write has occurred"]
+            )));
+        }
+
         let (head, tail) = src.split_at(to_copy);
         started_state.buffer.extend_from_slice(head);
+        started_state.buffer_data_size = started_state
+            .buffer_data_size
+            .max(started_state.buffer.len());
         let do_flush = started_state.buffer.capacity() == started_state.buffer.len();
         drop(state);
 
@@ -1027,7 +1126,7 @@ impl S3Sink {
             self.flush_current_buffer()?;
         }
 
-        if to_copy < src.len() {
+        if tail.len() > 0 {
             self.update_buffer(tail)?;
         }
 
@@ -1065,6 +1164,109 @@ impl S3Sink {
             )),
         }
     }
+
+    /**
+     * Attempt to seek to some location within the overall upload.
+     * At this time, the only seeking that can happen is to places
+     * within the cached parts.  If the seek is outside of the cached
+     * parts, the seek will fail.  The cases to evaluate are:
+     *   1. new_offset == current position:
+     *      return true (do nothing)
+     *   2. new_offset is within the current buffer:
+     *      change the write head position on the buffer
+     *      return true
+     *   3. new_offset is within the cache:
+     *      flush
+     *      switch to cached buffer, part number
+     *      change the write head position on the buffer
+     */
+    fn seek(self: &S3Sink, new_offset: u64) -> Result<(), Option<gst::ErrorMessage>> {
+        let mut state = self.state.lock().unwrap();
+        let started_state = match *state {
+            State::Started(ref mut started_state) => started_state,
+            State::Completed => {
+                unreachable!("Upload should not be completed yet");
+            }
+            State::Stopped => {
+                unreachable!("Element should be started");
+            }
+        };
+
+        // Case 1: no-op.
+        if started_state.upload_pos == new_offset {
+            return Ok(());
+        }
+
+        // Determine if new_offset is within the current part or one in the cache.
+        let part_start =
+            (started_state.part_number as u64 - 1) * started_state.buffer.capacity() as u64;
+        let part_end = part_start + started_state.buffer_data_size as u64;
+        let part_limits = part_start..part_end;
+
+        gst::trace!(CAT, imp: self, "Current part {} {part_limits:?} - seeking to {new_offset}", started_state.part_number);
+
+        let mut next_part = 0;
+        let cache_result = started_state.cache.find(new_offset, &mut next_part);
+
+        let offset_in_buffer = new_offset as usize % started_state.buffer.capacity();
+
+        if part_limits.contains(&new_offset) {
+            gst::trace!(CAT, imp: self, "Seeking to offset {} within current buffer", new_offset);
+            started_state.buffer_data_size = started_state
+                .buffer_data_size
+                .max(started_state.buffer.len());
+            started_state.upload_pos = new_offset;
+            unsafe {
+                started_state.buffer.set_len(offset_in_buffer);
+            }
+
+            return Ok(());
+        } else if cache_result.is_ok() {
+            let result = cache_result.unwrap();
+            let next_buffer = result.buffer.to_vec();
+            let next_size = result.data_size.to_owned();
+
+            if 0 < next_buffer.len() {
+                // cache hit
+                drop(state);
+                self.flush_current_buffer()?;
+
+                // Flushed okay, lock state again and update the buffer
+                let mut state = self.state.lock().unwrap();
+                let started_state = match *state {
+                    State::Started(ref mut started_state) => started_state,
+                    _ => unreachable!("Element should still be started"),
+                };
+
+                // Clear the cache miss flag
+                *self.write_will_cache_miss.lock().unwrap() = false;
+
+                gst::trace!(CAT, imp: self, "Seeking to offset {} within the cache (part {})", new_offset, next_part);
+
+                started_state.part_number = next_part.try_into().unwrap();
+                started_state.buffer = next_buffer;
+                started_state.buffer_data_size = next_size;
+                started_state.upload_pos = new_offset;
+                unsafe {
+                    started_state.buffer.set_len(offset_in_buffer);
+                }
+
+                return Ok(());
+            } else {
+                // cache miss -- the part information is known but no data was stored.
+                return Err(Some(gst::error_msg!(
+                    gst::StreamError::Failed,
+                    ["Buffer not cached for part {next_part}"]
+                )));
+            }
+        } else {
+            // Seek requested to an unsupported location.
+            return Err(Some(gst::error_msg!(
+                gst::StreamError::Failed,
+                ["Attempted to seek into unreachable region"]
+            )));
+        }
+    }
 }
 
 #[glib::object_subclass]
@@ -1079,6 +1281,8 @@ impl ObjectImpl for S3Sink {
     fn constructed(&self) {
         self.parent_constructed();
 
+        *self.eos_pending.lock().unwrap() = false;
+        *self.write_will_cache_miss.lock().unwrap() = false;
         self.obj().set_sync(false);
     }
 
@@ -1260,7 +1464,11 @@ impl ObjectImpl for S3Sink {
                 }
             }
             "part-size" => {
-                settings.buffer_size = value.get::<u64>().expect("type checked upstream").try_into().unwrap();
+                settings.buffer_size = value
+                    .get::<u64>()
+                    .expect("type checked upstream")
+                    .try_into()
+                    .unwrap();
             }
             "num-cached-parts" => {
                 settings.num_cached_parts = value.get::<i64>().expect("type checked upstream");
@@ -1577,6 +1785,8 @@ impl BaseSinkImpl for S3Sink {
 
     fn event(&self, event: gst::Event) -> bool {
         if let gst::EventView::Eos(_) = event.view() {
+            *self.eos_pending.lock().unwrap() = true;
+            *self.write_will_cache_miss.lock().unwrap() = false;
             if let Err(error_message) = self.finalize_upload() {
                 gst::error!(
                     CAT,
@@ -1585,6 +1795,28 @@ impl BaseSinkImpl for S3Sink {
                     error_message
                 );
                 return false;
+            }
+        } else if let gst::EventView::Segment(event) = event.view() {
+            let mut state = self.state.lock().unwrap();
+            match *state {
+                State::Started(ref mut started_state) => started_state,
+                State::Completed => {
+                    unreachable!("Upload should not be completed yet");
+                }
+                State::Stopped => {
+                    unreachable!("Element should be started already");
+                }
+            };
+            if event.segment().format() == gst::Format::Bytes {
+                let segment = event.segment();
+                drop(state);
+                // value() is an i64, however the docs do not state what a negative bytes offset
+                // would imply since in practice it seems to always be an absolute offset from 0.
+                // If we get a negative number here, let it barf here.
+                if let Err(error_message) = self.seek(segment.start().value().try_into().unwrap()) {
+                    gst::error!(CAT, imp: self, "Failed to seek: {:?}", error_message);
+                    return false;
+                }
             }
         }
 
