@@ -250,6 +250,44 @@ mod tests {
 
     #[ignore = "failing, needs investigation"]
     #[tokio::test]
+    async fn test_s3_multipart_query_seeking() {
+        // Verfies the basesink::query handler is providing correct replies to Bytes -formatted
+        // Seeking queries.  For now this test only verifies that it replies to seeking queries
+        // with 0->max if caching is enabled since at this time it's unclear the right way to
+        // represent a gap in seeking capability, for example head caching of 1 part but having
+        // written into part 5, a seek request (via segment event) could go into either the
+        // part cache or it could be within the locally-held buffer's range -- either of those
+        // is logically correct, but there's only one pair of limits in this reply.  Therefore
+        // this current implementation only replies 0->max if the cache is enabled and will
+        // reply negatively in the event a segment goes out of range.
+        init();
+
+        let (region, bucket, key) = get_env_args("query-position");
+        let uri = get_uri(&region, &bucket, &key);
+
+        let h1 = gst_check::Harness::new_parse(&format!(
+            "awss3sink name=\"sink\" uri=\"{uri}\" num-cached-parts=1"
+        ));
+        let h1el = h1
+            .element()
+            .unwrap()
+            .dynamic_cast::<gst::Bin>()
+            .unwrap()
+            .by_name("sink")
+            .unwrap();
+        let pad = h1el.static_pad("sink").unwrap();
+
+        let mut q = gst::query::Seeking::new(gst::Format::Bytes);
+        assert!(pad.query(q.query_mut()));
+
+        let (seekable, lower, upper) = q.result();
+        assert!(seekable);
+        assert_eq!(0, lower.value() as u64);
+        assert_eq!(u64::MAX - 1, upper.value() as u64);
+    }
+
+    #[ignore = "failing, needs investigation"]
+    #[tokio::test]
     async fn test_s3_put_object_simple() {
         do_s3_putobject_test("s3-put-object-test", None, None, None, true).await;
     }
