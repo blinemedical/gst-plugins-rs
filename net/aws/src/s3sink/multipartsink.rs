@@ -261,7 +261,7 @@ impl UploaderPartCache {
      * be from the cache.  If the buffer was stored per the configuration, then 'buffer' will
      * be filled with a copy.
      */
-    pub fn find(&self, offset: u64, part_num: &mut u16) -> Result<&PartInfo, gst::ErrorMessage> {
+    pub fn find(&self, offset: u64) -> Result<(&PartInfo, u16), gst::ErrorMessage> {
         let mut i = 1;
         let mut start = 0_u64;
 
@@ -270,8 +270,7 @@ impl UploaderPartCache {
             let range = start..start + item_size;
 
             if range.contains(&offset) {
-                *part_num = i;
-                return Ok(self.get(i).unwrap());
+                return Ok((self.get(i).unwrap(), i));
             }
             i += 1;
             start += item_size;
@@ -298,7 +297,6 @@ mod tests {
 
         let mut uut = UploaderPartCache::new(DEPTH);
         let buffer = vec![0; SIZE_BUFFER];
-        let mut part_num: u16 = 0;
 
         // Nothing stored, so cache availability.
         let mut limits = uut.coverage_limits();
@@ -312,7 +310,7 @@ mod tests {
         assert!(uut.update_or_append(1_usize, &buffer));
         assert_eq!(uut.cache.len(), 1);
 
-        let result = uut.find(SIZE_BUFFER as u64 / 2, &mut part_num).unwrap();
+        let (result, part_num) = uut.find(SIZE_BUFFER as u64 / 2).unwrap();
         assert!(result.buffer.is_none());
         assert_eq!(SIZE_BUFFER, result.data_size);
         assert_eq!(1, part_num);
@@ -360,16 +358,17 @@ mod tests {
         // Validate the cache offsets
         let mut offset_start: u64 = 0;
         for i in 1..NUM_PARTS as u16 {
-            let mut out_part_num = 0;
             let offset_end = (offset_start + BUFFER_SIZE as u64) - 1;
 
-            let mut result = uut.find(offset_start, &mut out_part_num);
-            assert!(result.is_ok());
-            assert_eq!(out_part_num, i);
+            let mut find_result = uut.find(offset_start);
+            assert!(find_result.is_ok());
+            let (_, mut part_num) = find_result.unwrap();
+            assert_eq!(part_num, i);
 
-            result = uut.find(offset_end, &mut out_part_num);
-            assert!(result.is_ok());
-            assert_eq!(out_part_num, i);
+            find_result = uut.find(offset_end);
+            assert!(find_result.is_ok());
+            (_, part_num) = find_result.unwrap();
+            assert_eq!(part_num, i);
 
             offset_start = offset_end + 1;
         }
@@ -384,11 +383,10 @@ mod tests {
         let mut uut = UploaderPartCache::new(0);
         let mut out_buffer_size = 0;
         let mut out_buffer: Vec<u8> = Default::default();
-        let mut out_part_num = 0;
         let buffer = vec![0; BUFFER_SIZE];
 
         // Should not be able to find anything; nothing exists yet.
-        assert!(uut.find(20, &mut out_part_num).is_err());
+        assert!(uut.find(20).is_err());
 
         // Should not be able to get the first part, it hasn't been inserted.
         assert!(!uut.get_copy(1_u16, &mut out_buffer, &mut out_buffer_size));
@@ -401,12 +399,12 @@ mod tests {
 
         // Should be able to access part 1, but it's buffer should be empty
         // since it's beyond the depth being retained in the cache.
-        let result = uut.find(BUFFER_SIZE as u64 - 1, &mut out_part_num).unwrap();
+        let (result, _) = uut.find(BUFFER_SIZE as u64 - 1).unwrap();
         assert!(result.buffer.is_none());
         assert_eq!(result.data_size, BUFFER_SIZE);
 
         // Should not be able to find offset 100 since that would be part 2
-        assert!(uut.find(100, &mut out_part_num).is_err());
+        assert!(uut.find(100).is_err());
     }
 
     /**
@@ -1204,8 +1202,7 @@ impl S3Sink {
 
         gst::trace!(CAT, imp: self, "Current part {} {part_limits:?} - seeking to {new_offset}", started_state.part_number);
 
-        let mut next_part = 0;
-        let cache_result = started_state.cache.find(new_offset, &mut next_part);
+        let cache_result = started_state.cache.find(new_offset);
 
         let offset_in_buffer = new_offset as usize % started_state.buffer.capacity();
 
@@ -1220,7 +1217,7 @@ impl S3Sink {
             }
 
             return Ok(());
-        } else if let Ok(result) = cache_result {
+        } else if let Ok((result, next_part)) = cache_result {
             let next_buffer = result.buffer.as_ref().unwrap_or(&Vec::new()).to_owned();
             if 0 < next_buffer.len() {
                 let next_size = result.data_size.to_owned();
