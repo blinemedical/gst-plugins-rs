@@ -240,20 +240,14 @@ impl UploaderPartCache {
     }
 
     #[allow(unused)]
-    pub fn get_copy<T: Into<usize>>(
-        &self,
-        part_num: T,
-        buffer: &mut Vec<u8>,
-        size: &mut usize,
-    ) -> bool {
-        match self.get(part_num) {
-            Some(part) => {
-                *buffer = part.buffer.as_ref().unwrap_or(&Vec::new()).to_owned();
-                *size = part.data_size;
-                true
-            }
-            None => false,
+    pub fn get_copy<T: Into<usize>>(&self, part_num: T) -> Option<(Vec<u8>, usize)> {
+        if let Some(part) = self.get(part_num) {
+            return Some((
+                part.buffer.as_ref().unwrap_or(&Vec::new()).to_owned(),
+                part.data_size,
+            ));
         }
+        None
     }
 
     /**
@@ -317,9 +311,9 @@ mod tests {
 
         // 'get' should work too, same behavior as above since caching
         // of the contents of the part is disabled.
-        let mut out_buffer = vec![0; SIZE_BUFFER];
-        let mut out_buffer_size: usize = 0;
-        assert!(uut.get_copy(part_num, &mut out_buffer, &mut out_buffer_size));
+        let get_result = uut.get_copy(part_num);
+        assert!(get_result.is_some());
+        let (out_buffer, out_buffer_size) = get_result.unwrap();
         assert_eq!(out_buffer.len(), 0);
         assert_eq!(SIZE_BUFFER, out_buffer_size);
 
@@ -381,15 +375,14 @@ mod tests {
     fn cache_miss() {
         const BUFFER_SIZE: usize = 100;
         let mut uut = UploaderPartCache::new(0);
-        let mut out_buffer_size = 0;
-        let mut out_buffer: Vec<u8> = Default::default();
+        let out_buffer: Vec<u8> = Default::default();
         let buffer = vec![0; BUFFER_SIZE];
 
         // Should not be able to find anything; nothing exists yet.
         assert!(uut.find(20).is_err());
 
         // Should not be able to get the first part, it hasn't been inserted.
-        assert!(!uut.get_copy(1_u16, &mut out_buffer, &mut out_buffer_size));
+        assert!(uut.get_copy(1_u16).is_none());
 
         // Size is 0, so inserting part number 2 is invalid; this should fail.
         assert!(!uut.update_or_append(2_usize, &out_buffer));
@@ -415,21 +408,16 @@ mod tests {
         const BUFFER_SIZE: usize = 100;
         let mut uut = UploaderPartCache::new(2);
         let in_buffer = vec![0; BUFFER_SIZE];
-        let mut out_buffer: Vec<u8> = Default::default();
-        let mut out_buffer_size: usize = 0;
 
         assert_eq!(uut.cache.len(), 0);
 
         for i in 1..=uut.max_depth + 1 {
-            let mut temp: Vec<u8> = Default::default();
-            let mut temp_size = 0 as usize;
-
             assert!(uut.update_or_append(i, &in_buffer));
 
             // Since this is head retention, immediately upon insertion
             // if the part number is within the limit, it should be kept,
             // otherwise immediately dropped.
-            assert!(uut.get_copy(i, &mut temp, &mut temp_size));
+            let (temp, temp_size) = uut.get_copy(i).unwrap();
             if i <= uut.max_depth {
                 // Retained
                 assert!(temp.len() != 0);
@@ -450,19 +438,21 @@ mod tests {
         assert_eq!((BUFFER_SIZE as u64) * 2 - 1, offsets.1);
 
         // 1 and 2 should have a buffer, 3 should not.
-        assert!(uut.get_copy(1_u16, &mut out_buffer, &mut out_buffer_size));
+        let mut get_result = uut.get_copy(1_u16);
+        assert!(get_result.is_some());
+        let (mut out_buffer, mut out_buffer_size) = get_result.unwrap();
         assert!(out_buffer.len() == BUFFER_SIZE);
         assert!(out_buffer_size == BUFFER_SIZE);
-        out_buffer.clear();
-        out_buffer_size = 0;
 
-        assert!(uut.get_copy(2_u16, &mut out_buffer, &mut out_buffer_size));
+        get_result = uut.get_copy(2_u16);
+        assert!(get_result.is_some());
+        (out_buffer, out_buffer_size) = get_result.unwrap();
         assert!(out_buffer.len() == BUFFER_SIZE);
         assert!(out_buffer_size == BUFFER_SIZE);
-        out_buffer.clear();
-        out_buffer_size = 0;
 
-        assert!(uut.get_copy(3_u16, &mut out_buffer, &mut out_buffer_size));
+        get_result = uut.get_copy(3_u16);
+        assert!(get_result.is_some());
+        (out_buffer, out_buffer_size) = get_result.unwrap();
         assert!(out_buffer.len() == 0);
         assert!(out_buffer_size == BUFFER_SIZE);
     }
@@ -475,37 +465,28 @@ mod tests {
         const BUFFER_SIZE: usize = 100;
         let mut uut = UploaderPartCache::new(-2);
         let in_buffer = vec![0; BUFFER_SIZE];
-        let mut out_buffer: Vec<u8> = Default::default();
-        let mut out_buffer_size = 0;
 
         assert_eq!(uut.cache.len(), 0);
         for i in 1..=uut.max_depth + 1 {
-            let mut temp: Vec<u8> = Default::default();
-            let mut temp_size = 0 as usize;
-
             assert!(uut.update_or_append(i, &in_buffer));
 
             // Since this is tail retention, the most recent part should
             // always be retained.
-            assert!(uut.get_copy(i, &mut temp, &mut temp_size));
+            let (temp, temp_size) = uut.get_copy(i).unwrap();
             assert!(temp.len() != 0);
             assert!(temp_size == BUFFER_SIZE);
         }
 
         // 1 should not have a buffer, 2 and 3 should.
-        assert!(uut.get_copy(1_usize, &mut out_buffer, &mut out_buffer_size));
+        let (mut out_buffer, mut out_buffer_size) = uut.get_copy(1_usize).unwrap();
         assert!(out_buffer.len() == 0);
         assert!(out_buffer_size == BUFFER_SIZE);
-        out_buffer.clear();
-        out_buffer_size = 0;
 
-        assert!(uut.get_copy(2_usize, &mut out_buffer, &mut out_buffer_size));
+        (out_buffer, out_buffer_size) = uut.get_copy(2_usize).unwrap();
         assert!(out_buffer.len() == BUFFER_SIZE);
         assert!(out_buffer_size == BUFFER_SIZE);
-        out_buffer.clear();
-        out_buffer_size = 0;
 
-        assert!(uut.get_copy(3_usize, &mut out_buffer, &mut out_buffer_size));
+        (out_buffer, out_buffer_size) = uut.get_copy(3_usize).unwrap();
         assert!(out_buffer.len() == BUFFER_SIZE);
         assert!(out_buffer_size == BUFFER_SIZE);
 
