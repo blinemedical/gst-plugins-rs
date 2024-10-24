@@ -1326,7 +1326,9 @@ impl ObjectImpl for S3Sink {
                     .build(),
                 glib::ParamSpecInt64::builder("num-cached-parts")
                     .nick("Number of parts to cache (seeking)")
-                    .blurb("Number of parts to cache to enable seeking before the multipart upload completes")
+                    .blurb(
+                        "Number of parts to cache to enable seeking before the multipart upload completes.  \
+                         A positive number caches from the start of the stream; a negative number caches from the end.")
                     .minimum(-1 * MAX_MULTIPART_NUMBER)
                     .maximum(MAX_MULTIPART_NUMBER)
                     .default_value(DEFAULT_NUM_CACHED_PARTS)
