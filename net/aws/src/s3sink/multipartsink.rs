@@ -256,22 +256,21 @@ impl UploaderPartCache {
      * be filled with a copy.
      */
     pub fn find(&self, offset: u64) -> Result<(&PartInfo, u16), gst::ErrorMessage> {
-        let mut i = 1;
         let mut start = 0_u64;
 
-        for item in self.cache.iter() {
+        for (i, item) in self.cache.iter().enumerate() {
             let item_size: u64 = item.data_size.try_into().unwrap();
             let range = start..start + item_size;
+            let part_num = (i+1) as u16;
 
             if range.contains(&offset) {
-                return Ok((self.get(i).unwrap(), i));
+                return Ok((self.get(part_num).unwrap(), part_num));
             }
-            i += 1;
             start += item_size;
         }
         return Err(gst::error_msg!(
             gst::ResourceError::NotFound,
-            ["Could not find part {i} in cache"]
+            ["Could not find part for offset {offset} in cache"]
         ));
     }
 }
