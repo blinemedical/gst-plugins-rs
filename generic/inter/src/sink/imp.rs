@@ -15,12 +15,14 @@ const DEFAULT_PRODUCER_NAME: &str = "default";
 #[derive(Debug)]
 struct Settings {
     producer_name: String,
+    event_types: Option<Vec<gst::EventType>>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             producer_name: DEFAULT_PRODUCER_NAME.to_string(),
+            event_types: None,
         }
     }
 }
@@ -38,12 +40,20 @@ pub struct InterSink {
 
 impl InterSink {
     fn prepare(&self) -> Result<(), Error> {
-        let settings = self.settings.lock().unwrap();
+        let mut settings = self.settings.lock().unwrap();
         let state = self.state.lock().unwrap();
 
-        InterStreamProducer::acquire(&settings.producer_name, &state.appsink)?;
-
-        Ok(())
+        match InterStreamProducer::acquire(&settings.producer_name, &state.appsink) {
+            Ok(producer) => {
+                if let Some(types) = settings.event_types.as_ref() {
+                    producer.set_forward_events(types.clone());
+                } else {
+                    settings.event_types = Some(producer.get_forward_events());
+                }
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn unprepare(&self) {
@@ -83,12 +93,28 @@ impl ObjectSubclass for InterSink {
 impl ObjectImpl for InterSink {
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
-            vec![glib::ParamSpecString::builder("producer-name")
-                .nick("Producer Name")
-                .blurb("Producer Name to use")
-                .doc_show_default()
-                .mutable_playing()
-                .build()]
+            vec![
+                glib::ParamSpecString::builder("producer-name")
+                    .nick("Producer Name")
+                    .blurb("Producer Name to use")
+                    .doc_show_default()
+                    .mutable_playing()
+                    .build(),
+                gst::ParamSpecArray::builder("event-types")
+                    .element_spec(
+                        &glib::ParamSpecEnum::builder_with_default(
+                            "event-type",
+                            gst::EventType::Eos,
+                        )
+                        .nick("Event Type")
+                        .blurb("Event Type")
+                        .build(),
+                    )
+                    .nick("Forwarded Event Types")
+                    .blurb("Forwarded Event Types (default Eos)")
+                    .mutable_ready()
+                    .build(),
+            ]
         });
 
         PROPERTIES.as_ref()
@@ -123,6 +149,16 @@ impl ObjectImpl for InterSink {
                     }
                 }
             }
+            "event-types" => {
+                let mut settings = self.settings.lock().unwrap();
+                let types = value
+                    .get::<gst::Array>()
+                    .expect("type checked upstream")
+                    .iter()
+                    .map(|v| v.get::<gst::EventType>().expect("type checked upstream"))
+                    .collect::<Vec<_>>();
+                settings.event_types = Some(types);
+            }
             _ => unimplemented!(),
         };
     }
@@ -132,6 +168,17 @@ impl ObjectImpl for InterSink {
             "producer-name" => {
                 let settings = self.settings.lock().unwrap();
                 settings.producer_name.to_value()
+            }
+            "event-types" => {
+                let settings = self.settings.lock().unwrap();
+                settings
+                    .event_types
+                    .as_ref()
+                    .unwrap_or(&Vec::new())
+                    .iter()
+                    .map(|x| x.to_send_value())
+                    .collect::<gst::Array>()
+                    .to_value()
             }
             _ => unimplemented!(),
         }
