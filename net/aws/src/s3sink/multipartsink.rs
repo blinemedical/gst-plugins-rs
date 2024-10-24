@@ -110,14 +110,14 @@ impl Started {
 }
 
 struct PartInfo {
-    pub buffer: Vec<u8>,
+    pub buffer: Option<Vec<u8>>,
     pub data_size: usize,
 }
 
 impl PartInfo {
-    fn new(size: usize, capacity: usize) -> PartInfo {
+    fn new(size: usize) -> PartInfo {
         PartInfo {
-            buffer: Vec::with_capacity(capacity),
+            buffer: None,
             data_size: size,
         }
     }
@@ -160,8 +160,8 @@ impl UploaderPartCache {
         let mut offset: u64 = 0;
 
         for record in self.cache.iter() {
-            let offset_after = offset + record.buffer.len() as u64;
-            if record.buffer.len() > 0 {
+            if let Some(buffer) = record.buffer.as_ref() {
+                let offset_after = offset + buffer.len() as u64;
                 if beginning.is_none() {
                     beginning = Some(offset);
                 }
@@ -196,8 +196,7 @@ impl UploaderPartCache {
         if part_idx == self.cache.len() {
             // Insert new one
             // NOTE: will deal with buffer later if necessary
-            self.cache
-                .push(PartInfo::new(buffer.len(), buffer.capacity()));
+            self.cache.push(PartInfo::new(buffer.len()));
         } else {
             // update data size, at a minimum
             self.cache[part_idx].data_size = buffer.len();
@@ -228,12 +227,12 @@ impl UploaderPartCache {
                     // part is in 'retain' range
                     if i == part_idx {
                         // 'buffer' is this part; update it
-                        part.buffer = buffer.to_owned();
+                        part.buffer = Some(buffer.to_owned());
                         part.data_size = buffer.len();
                     }
                 } else {
                     // part not in 'retain' range; ensure it's cleared.
-                    part.buffer.clear();
+                    part.buffer = None;
                 }
             }
         }
@@ -249,7 +248,7 @@ impl UploaderPartCache {
     ) -> bool {
         match self.get(part_num) {
             Some(part) => {
-                *buffer = part.buffer.to_vec();
+                *buffer = part.buffer.as_ref().unwrap_or(&Vec::new()).to_owned();
                 *size = part.data_size;
                 true
             }
@@ -314,8 +313,8 @@ mod tests {
         assert_eq!(uut.cache.len(), 1);
 
         let result = uut.find(SIZE_BUFFER as u64 / 2, &mut part_num).unwrap();
-        assert_eq!(0, result.buffer.len());
-        assert_eq!(SIZE_BUFFER, result.buffer.capacity());
+        assert!(result.buffer.is_none());
+        assert_eq!(SIZE_BUFFER, result.data_size);
         assert_eq!(1, part_num);
 
         // 'get' should work too, same behavior as above since caching
@@ -403,7 +402,7 @@ mod tests {
         // Should be able to access part 1, but it's buffer should be empty
         // since it's beyond the depth being retained in the cache.
         let result = uut.find(BUFFER_SIZE as u64 - 1, &mut out_part_num).unwrap();
-        assert_eq!(result.buffer.len(), 0);
+        assert!(result.buffer.is_none());
         assert_eq!(result.data_size, BUFFER_SIZE);
 
         // Should not be able to find offset 100 since that would be part 2
@@ -750,7 +749,12 @@ impl S3Sink {
         let eos_pending = self.eos_pending.lock().unwrap();
         match state.cache.get(state.part_number as usize) {
             Some(part) => {
-                if part.buffer.is_empty() {
+                if let Some(buffer) = part.buffer.as_ref() {
+                    // Cache hit (case 2) -- the part number was known and the buffer
+                    // was a part of the cache
+                    state.buffer = buffer.to_owned();
+                    state.buffer_data_size = part.data_size;
+                } else {
                     if false == *eos_pending {
                         // Cache miss (case 3) -- the part number was known but the buffer
                         // was not stored in the cache (because of the cache configuration).
@@ -758,11 +762,6 @@ impl S3Sink {
                         state.buffer_data_size = 0;
                         gst::debug!(CAT, imp:self, "Next write will cause a cache miss unless another seek is performed.");
                     }
-                } else {
-                    // Cache hit (case 2) -- the part number was known and the buffer
-                    // was a part of the cache
-                    state.buffer = part.buffer.to_owned();
-                    state.buffer_data_size = part.data_size;
                 }
                 Ok(())
             }
@@ -1221,12 +1220,11 @@ impl S3Sink {
             }
 
             return Ok(());
-        } else if cache_result.is_ok() {
-            let result = cache_result.unwrap();
-            let next_buffer = result.buffer.to_vec();
-            let next_size = result.data_size.to_owned();
-
+        } else if let Ok(result) = cache_result {
+            let next_buffer = result.buffer.as_ref().unwrap_or(&Vec::new()).to_owned();
             if 0 < next_buffer.len() {
+                let next_size = result.data_size.to_owned();
+
                 // cache hit
                 drop(state);
                 self.flush_current_buffer()?;
