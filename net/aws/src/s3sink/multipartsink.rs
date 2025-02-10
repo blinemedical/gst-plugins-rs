@@ -1796,19 +1796,19 @@ impl BaseSinkImpl for S3Sink {
                         let mut state = self.state.lock().unwrap();
                         match *state {
                             State::Started(ref mut started_state) => {
-                                // TODO: unclear how to really respond here since  it is
-                                // possible to seek to within the range of the cache OR to
-                                // within the range of the currently active buffer, and when
-                                // the currently active buffer is not in the bounds of what
-                                // is in the cache, there's no way to provide both sets of
-                                // limits to the reply.  So if cache is enabled, give an
-                                // affirmative "anywhere" response and we'll argue this point
-                                // when dealing with segment events.
-                                let mut max = 0_u64;
-                                if started_state.cache.max_depth > 0 {
-                                    max = u64::MAX - 1;
+                                // If no parts are requested to be cached, make the stream
+                                // non-seekable, becuase we can only seek within the current
+                                // buffer. Outside of that, assume the user has selected a
+                                // reasonable amount of cache to do what they want.
+                                if self.settings.lock().unwrap().num_cached_parts == 0 {
+                                    (false, 0, 0)
+                                } else {
+                                    let mut max = 0_u64;
+                                    if started_state.cache.max_depth > 0 {
+                                        max = u64::MAX - 1;
+                                    }
+                                    (true, 0, max)
                                 }
-                                (true, 0, max)
                             }
                             _ => (false, 0, 0),
                         }
