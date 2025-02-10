@@ -209,9 +209,7 @@ impl UploaderPartCache {
                 // Keeping the last / most recent N buffers
                 last = self.cache.len();
                 if self.max_depth < last {
-                    let l = last as isize;
-                    let d = self.max_depth as isize;
-                    first = (l - d).try_into().unwrap();
+                    first = last - self.max_depth;
                 } else {
                     first = 0;
                 }
@@ -254,7 +252,7 @@ impl UploaderPartCache {
         let mut start = 0_u64;
 
         for (i, item) in self.cache.iter().enumerate() {
-            let item_size: u64 = item.data_size.try_into().unwrap();
+            let item_size: u64 = item.data_size as u64;
             let range = start..start + item_size;
             let part_num = (i + 1) as u16;
 
