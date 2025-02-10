@@ -153,6 +153,7 @@ impl UploaderPartCache {
      * from the cache.  This might be a helpful alternative to calling find if
      * the only interest is if one can expect the find to succeed.
      */
+    #[allow(unused)]
     pub fn coverage_limits(&self) -> (u64, u64) {
         let mut beginning: Option<u64> = None;
         let mut ending: Option<u64> = None;
@@ -175,11 +176,6 @@ impl UploaderPartCache {
             }
         }
         (beginning.unwrap_or(0), ending.unwrap_or(0))
-    }
-
-    pub fn coverage_range(&self) -> std::ops::Range<u64> {
-        let (start, end) = self.coverage_limits();
-        start..end
     }
 
     pub fn update_or_append<T: Into<usize>>(&mut self, part_num: T, buffer: &Vec<u8>) -> bool {
