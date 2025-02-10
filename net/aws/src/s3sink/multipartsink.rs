@@ -59,10 +59,10 @@ struct Started {
     client: Client,
     // the active part's buffer
     buffer: Vec<u8>,
-    // active buffer's "data size" represents the last offset of
-    // data that was written to the buffer prior to manually setting
+    // active buffer's offset represents the last offset of data written to the
+    // buffer. data that was written to the buffer prior to manually setting
     // the buffer's len() during a seek operation.
-    buffer_data_size: usize,
+    buffer_offset: usize,
     upload_id: String,
     part_number: i64, // the active part number
     completed_parts: Vec<CompletedPart>,
@@ -83,7 +83,7 @@ impl Started {
         Started {
             client,
             buffer,
-            buffer_data_size: 0,
+            buffer_offset: 0,
             upload_id,
             part_number: 1,
             completed_parts: Vec::new(),
@@ -711,9 +711,9 @@ impl S3Sink {
             None => state.completed_parts.push(completed_part),
         }
 
-        // state.buffer_data_size is still set to the length of this most recently uploaded
-        // buffer, so increment the global write head position (upload_pos) with it.
-        state.upload_pos += state.buffer_data_size as u64;
+        // Upload our write position by the last write offset (which will also
+        // be the final part size).
+        state.upload_pos += state.buffer_offset as u64;
 
         gst::info!(CAT, imp = self, "Uploaded part {}", state.part_number);
 
@@ -736,13 +736,13 @@ impl S3Sink {
                     // Cache hit (case 2) -- the part number was known and the buffer
                     // was a part of the cache
                     state.buffer = buffer.to_owned();
-                    state.buffer_data_size = part.data_size;
+                    state.buffer_offset = 0;
                 } else {
                     if false == *eos_pending {
                         // Cache miss (case 3) -- the part number was known but the buffer
                         // was not stored in the cache (because of the cache configuration).
                         *self.write_will_cache_miss.lock().unwrap() = true;
-                        state.buffer_data_size = 0;
+                        state.buffer_offset = 0;
                         gst::debug!(
                             CAT,
                             imp = self,
@@ -754,7 +754,7 @@ impl S3Sink {
             }
             None => {
                 // case 1
-                state.buffer_data_size = 0;
+                state.buffer_offset = 0;
                 Ok(())
             }
         }
@@ -779,17 +779,9 @@ impl S3Sink {
             }
         };
 
-        if state.buffer_data_size == 0 {
+        if state.buffer_offset == 0 {
             // Nothing to upload.
             return Ok(None);
-        }
-
-        // Update buffer len() to buffer_data_size, in the event the two
-        // became out of sync because of seeking.  This ensures that the
-        // data size is stored correctly in the cache and copied fully
-        // into the request body.
-        unsafe {
-            state.buffer.set_len(state.buffer_data_size);
         }
 
         // Update/append the part cache
@@ -1095,7 +1087,7 @@ impl S3Sink {
         };
 
         let to_copy = std::cmp::min(
-            started_state.buffer.capacity() - started_state.buffer.len(),
+            started_state.buffer.capacity() - started_state.buffer_offset,
             src.len(),
         );
 
@@ -1106,12 +1098,27 @@ impl S3Sink {
             )));
         }
 
+        gst::trace!(
+            CAT,
+            imp = self,
+            "Updating buffer at {} wiith {} bytes",
+            started_state.buffer_offset,
+            to_copy
+        );
+
         let (head, tail) = src.split_at(to_copy);
-        started_state.buffer.extend_from_slice(head);
-        started_state.buffer_data_size = started_state
-            .buffer_data_size
-            .max(started_state.buffer.len());
-        let do_flush = started_state.buffer.capacity() == started_state.buffer.len();
+        if started_state.buffer_offset == started_state.buffer.len() {
+            // Writing to end of buffer
+            started_state.buffer.extend_from_slice(head);
+        } else {
+            // Writing mid-buffer after a seek
+            let start = started_state.buffer_offset;
+            let end = start + head.len();
+            started_state.buffer[start..end].copy_from_slice(head);
+        }
+        started_state.buffer_offset += head.len();
+
+        let do_flush = started_state.buffer.capacity() == started_state.buffer_offset;
         drop(state);
 
         if do_flush {
@@ -1192,7 +1199,7 @@ impl S3Sink {
         // Determine if new_offset is within the current part or one in the cache.
         let part_start =
             (started_state.part_number as u64 - 1) * started_state.buffer.capacity() as u64;
-        let part_end = part_start + started_state.buffer_data_size as u64;
+        let part_end = part_start + started_state.buffer.len() as u64;
         let part_limits = part_start..part_end;
 
         gst::trace!(
@@ -1213,20 +1220,13 @@ impl S3Sink {
                 "Seeking to offset {} within current buffer",
                 new_offset
             );
-            started_state.buffer_data_size = started_state
-                .buffer_data_size
-                .max(started_state.buffer.len());
+            started_state.buffer_offset = offset_in_buffer;
             started_state.upload_pos = new_offset;
-            unsafe {
-                started_state.buffer.set_len(offset_in_buffer);
-            }
 
             return Ok(());
         } else if let Ok((result, next_part)) = cache_result {
             let next_buffer = result.buffer.as_ref().unwrap_or(&Vec::new()).to_owned();
             if 0 < next_buffer.len() {
-                let next_size = result.data_size.to_owned();
-
                 // cache hit
                 drop(state);
                 self.flush_current_buffer()?;
@@ -1251,11 +1251,8 @@ impl S3Sink {
 
                 started_state.part_number = next_part.try_into().unwrap();
                 started_state.buffer = next_buffer;
-                started_state.buffer_data_size = next_size;
+                started_state.buffer_offset = offset_in_buffer;
                 started_state.upload_pos = new_offset;
-                unsafe {
-                    started_state.buffer.set_len(offset_in_buffer);
-                }
 
                 return Ok(());
             } else {
