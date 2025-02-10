@@ -238,9 +238,7 @@ mod tests {
 
         // Try to seek into part 1 (end of first packet).
         segment = gst::FormattedSegment::<gst::format::Bytes>::new();
-        segment.set_start(gst::format::Bytes::from_u64(
-            buffer_size.try_into().unwrap(),
-        ));
+        segment.set_start(gst::format::Bytes::from_u64(buffer_size as u64));
         assert!(h1.push_event(gst::event::Segment::new(&segment)));
 
         // Overwrite second packet of part 1: [01...][AA...][03...]...
@@ -272,6 +270,107 @@ mod tests {
 
                     for b in buffer.as_slice() {
                         if buffer_size <= location && location < 2 * buffer_size {
+                            assert_eq!(b, &0xAA_u8);
+                        } else {
+                            assert_eq!(b, &expect);
+                        }
+                        location += 1;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        assert_eq!(location, num_buffers * buffer_size);
+
+        delete_object(region.clone(), &bucket, &key).await;
+    }
+
+    /**
+     * This test will run the sink with 2 parts cached at the head (start)
+     * of the upload.  It will push 12 packets (just over 2 parts), seek to
+     * a few bytes into the first part, write a change, do the same for the
+     * second part then EOS.  The expected result is the seek to use the cache,
+     * and the EOS to push the cached buffer and complete the upload.
+     */
+    #[test_with::env(AWS_ACCESS_KEY_ID)]
+    #[test_with::env(AWS_SECRET_ACCESS_KEY)]
+    #[tokio::test]
+    async fn test_s3_multipart_head_cached_multiple() {
+        init();
+
+        let (region, bucket, key) = get_env_args("head_cached_multiple");
+        let uri = get_uri(&region, &bucket, &key);
+        let buffer_size = 1024 * 1024;
+        let buffers_per_part = 5;
+        let part_size = buffer_size * buffers_per_part;
+        let num_buffers = 12;
+
+        let mut h1 = gst_check::Harness::new_parse(&format!(
+            "awss3sink name=\"sink\" uri=\"{uri}\" num-cached-parts=3 part-size={part_size}"
+        ));
+        h1.set_src_caps(gst::Caps::builder("text/plain").build());
+        h1.play();
+
+        // Push stream start, segment, and buffers
+        let mut segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        h1.push_event(gst::event::StreamStart::builder(&"test-stream").build());
+        h1.push_event(gst::event::Segment::new(&segment));
+        for i in 1..=(num_buffers - 1) as u8 {
+            let buffer = make_buffer(&vec![i; buffer_size]);
+            h1.push(buffer).unwrap();
+        }
+
+        // Try to seek into part 1 (end of first packet).
+        segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        segment.set_start(gst::format::Bytes::from_u64(buffer_size as u64));
+        assert!(h1.push_event(gst::event::Segment::new(&segment)));
+
+        // Overwrite second packet of part 1: [01...][AA...][03...]...
+        // This should succeed.
+        h1.push(make_buffer(&vec![0xAA; buffer_size])).unwrap();
+
+        // Try to seek into part 2 (end of first packet).
+        segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        segment.set_start(gst::format::Bytes::from_u64(buffer_size as u64 * 6));
+        assert!(h1.push_event(gst::event::Segment::new(&segment)));
+
+        // Overwrite second packet of part 2: [06...][AA...][08...]...
+        // This should succeed.
+        h1.push(make_buffer(&vec![0xAA; buffer_size])).unwrap();
+
+        // Now seek to the end and write one more buffer
+        segment = gst::FormattedSegment::<gst::format::Bytes>::new();
+        segment.set_start(gst::format::Bytes::from_u64(buffer_size as u64 * 11));
+        assert!(h1.push_event(gst::event::Segment::new(&segment)));
+        h1.push(make_buffer(&vec![12; buffer_size])).unwrap();
+
+        // EOS to finish the upload
+        h1.push_event(gst::event::Eos::new());
+
+        // FIXME: This seems to return too early -- before the file is finalized
+        // at S3 -- because the h2.play() occasionally fails on GstState change
+        // to playing because the file is not found.
+
+        //  Download and verify contents
+        let mut h2 = gst_check::Harness::new("awss3src");
+        h2.element().unwrap().set_property("uri", uri.clone());
+        h2.play();
+
+        let mut location: usize = 0;
+        let mut expect = 0x00_u8;
+        loop {
+            match h2.pull() {
+                Ok(temp) => {
+                    let buffer = temp.into_mapped_buffer_readable().unwrap();
+
+                    if 0 == location % buffer_size {
+                        expect += 1;
+                    }
+
+                    for b in buffer.as_slice() {
+                        if buffer_size <= location && location < 2 * buffer_size
+                            || 6 * buffer_size <= location && location < 7 * buffer_size
+                        {
                             assert_eq!(b, &0xAA_u8);
                         } else {
                             assert_eq!(b, &expect);
@@ -342,9 +441,7 @@ mod tests {
 
         // Seek back to the start of the second buffer, which is still the active part.
         segment = gst::FormattedSegment::<gst::format::Bytes>::new();
-        segment.set_start(gst::format::Bytes::from_u64(
-            buffer_size.try_into().unwrap(),
-        ));
+        segment.set_start(gst::format::Bytes::from_u64(buffer_size as u64));
         assert!(h1.push_event(gst::event::Segment::new(&segment)));
 
         // Overwrite that buffer, which should succeed.
@@ -408,7 +505,7 @@ mod tests {
         // Seek to near the end of part 1 (half a buffer from tail)
         segment = gst::FormattedSegment::<gst::format::Bytes>::new();
         segment.set_start(gst::format::Bytes::from_u64(
-            (part_size - (buffer_size / 2)).try_into().unwrap(),
+            (part_size - (buffer_size / 2)) as u64,
         ));
         assert!(h1.push_event(gst::event::Segment::new(&segment)));
 
@@ -454,7 +551,7 @@ mod tests {
         // Seek to the end of part 1 (a buffer from tail)
         segment = gst::FormattedSegment::<gst::format::Bytes>::new();
         segment.set_start(gst::format::Bytes::from_u64(
-            (part_size - buffer_size).try_into().unwrap(),
+            (part_size - buffer_size) as u64,
         ));
         assert!(h1.push_event(gst::event::Segment::new(&segment)));
 
