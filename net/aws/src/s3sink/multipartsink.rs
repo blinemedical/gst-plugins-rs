@@ -57,6 +57,7 @@ const MAX_MULTIPART_NUMBER: i64 = 10000;
 
 struct Started {
     client: Client,
+    part_size: usize,
     // the active part's buffer
     buffer: Vec<u8>,
     // active buffer's offset represents the last offset of data written to the
@@ -76,13 +77,14 @@ struct Started {
 impl Started {
     pub fn new(
         client: Client,
-        buffer: Vec<u8>,
+        part_size: usize,
         upload_id: String,
         num_cache_parts: i64,
     ) -> Started {
         Started {
             client,
-            buffer,
+            part_size,
+            buffer: Vec::with_capacity(part_size),
             buffer_offset: 0,
             upload_id,
             part_number: 1,
@@ -725,10 +727,9 @@ impl S3Sink {
             .cache
             .update_or_append(state.part_number as usize, &state.buffer);
 
-        let capacity = state.buffer.capacity();
         let body = Some(ByteStream::from(std::mem::replace(
             &mut state.buffer,
-            Vec::with_capacity(capacity),
+            Vec::with_capacity(state.part_size),
         )));
 
         let bucket = Some(url.as_ref().unwrap().bucket.to_owned());
@@ -997,7 +998,7 @@ impl S3Sink {
 
         *state = State::Started(Started::new(
             client,
-            Vec::with_capacity(settings.buffer_size as usize),
+            settings.buffer_size,
             upload_id,
             settings.num_cached_parts,
         ));
@@ -1023,7 +1024,7 @@ impl S3Sink {
         };
 
         let to_copy = std::cmp::min(
-            started_state.buffer.capacity() - started_state.buffer_offset,
+            started_state.part_size - started_state.buffer_offset,
             src.len(),
         );
 
@@ -1054,7 +1055,7 @@ impl S3Sink {
         }
         started_state.buffer_offset += head.len();
 
-        let do_flush = started_state.buffer.capacity() == started_state.buffer_offset;
+        let do_flush = started_state.part_size == started_state.buffer_offset;
         drop(state);
 
         if do_flush {
@@ -1133,8 +1134,7 @@ impl S3Sink {
         }
 
         // Determine if new_offset is within the current part or one in the cache.
-        let part_start =
-            (started_state.part_number as u64 - 1) * started_state.buffer.capacity() as u64;
+        let part_start = (started_state.part_number as u64 - 1) * started_state.part_size as u64;
         let part_end = part_start + started_state.buffer.len() as u64;
         let part_limits = part_start..part_end;
 
@@ -1147,7 +1147,7 @@ impl S3Sink {
 
         let cache_result = started_state.cache.find(new_offset);
 
-        let offset_in_buffer = new_offset as usize % started_state.buffer.capacity();
+        let offset_in_buffer = new_offset as usize % started_state.part_size;
 
         if part_limits.contains(&new_offset) {
             gst::trace!(
