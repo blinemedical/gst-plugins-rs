@@ -148,36 +148,6 @@ impl UploaderPartCache {
         self.cache.get_mut(part_num - 1)
     }
 
-    /**
-     * Returns the beginning and ending offsets (in bytes) that can be retrieved
-     * from the cache.  This might be a helpful alternative to calling find if
-     * the only interest is if one can expect the find to succeed.
-     */
-    #[allow(unused)]
-    pub fn coverage_limits(&self) -> (u64, u64) {
-        let mut beginning: Option<u64> = None;
-        let mut ending: Option<u64> = None;
-        let mut offset: u64 = 0;
-
-        for record in self.cache.iter() {
-            if let Some(buffer) = record.buffer.as_ref() {
-                let offset_after = offset + buffer.len() as u64;
-                if beginning.is_none() {
-                    beginning = Some(offset);
-                }
-
-                if beginning.is_some() {
-                    ending = Some(offset_after - 1);
-                }
-
-                offset = offset_after;
-            } else if record.data_size > 0 {
-                offset += record.data_size as u64;
-            }
-        }
-        (beginning.unwrap_or(0), ending.unwrap_or(0))
-    }
-
     pub fn update_or_append<T: Into<usize>>(&mut self, part_num: T, buffer: &Vec<u8>) -> bool {
         // confirm the part number makes logical sense: positive, non-zero, less than
         // the maximum amount permitted by AWS.
@@ -284,11 +254,6 @@ mod tests {
         let mut uut = UploaderPartCache::new(DEPTH);
         let buffer = vec![0; SIZE_BUFFER];
 
-        // Nothing stored, so cache availability.
-        let mut limits = uut.coverage_limits();
-        assert_eq!(0, limits.0);
-        assert_eq!(0, limits.1);
-
         // Insert and 'find' should both be TRUE since we're looking for the
         // cached buffer that would have offset 50 in it.  The resulting
         // buffer however is empty, since caching is "disabled".
@@ -308,12 +273,6 @@ mod tests {
         let (out_buffer, out_buffer_size) = get_result.unwrap();
         assert_eq!(out_buffer.len(), 0);
         assert_eq!(SIZE_BUFFER, out_buffer_size);
-
-        // Still nothing actually stored in the cache, so still 0's for
-        // the limits.
-        limits = uut.coverage_limits();
-        assert_eq!(0, limits.0);
-        assert_eq!(0, limits.1);
     }
 
     /**
@@ -334,11 +293,6 @@ mod tests {
             assert_eq!(uut.cache.len(), i - 1);
             assert!(uut.update_or_append(i, &vec![0; BUFFER_SIZE]));
             assert_eq!(uut.cache.len(), i);
-
-            // coverage offsets should be unchanged; depth is 0 (no cache).
-            let limits = uut.coverage_limits();
-            assert_eq!(0, limits.0);
-            assert_eq!(0, limits.1);
         }
 
         // Validate the cache offsets
@@ -423,12 +377,6 @@ mod tests {
         // There should be 3 parts in the cache (though only 2 are retained).
         assert_eq!(uut.cache.len(), 3);
 
-        // Coverage offsets should be 0 to BUFFER_SIZE*2 - 1 (the end of
-        // buffer 2).
-        let offsets = uut.coverage_limits();
-        assert_eq!(0, offsets.0);
-        assert_eq!((BUFFER_SIZE as u64) * 2 - 1, offsets.1);
-
         // 1 and 2 should have a buffer, 3 should not.
         let mut get_result = uut.get_copy(1_u16);
         assert!(get_result.is_some());
@@ -481,12 +429,6 @@ mod tests {
         (out_buffer, out_buffer_size) = uut.get_copy(3_usize).unwrap();
         assert!(out_buffer.len() == BUFFER_SIZE);
         assert!(out_buffer_size == BUFFER_SIZE);
-
-        // Coverage offsets should be BUFFER_SIZE to BUFFER_SIZE*3 - 1 (the end of
-        // buffer 2).
-        let offsets = uut.coverage_limits();
-        assert_eq!(BUFFER_SIZE as u64, offsets.0);
-        assert_eq!((BUFFER_SIZE as u64) * 3 - 1, offsets.1);
     }
 }
 
