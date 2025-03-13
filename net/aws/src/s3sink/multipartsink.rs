@@ -187,8 +187,11 @@ impl UploaderPartCache {
                 }
             }
 
+            let is_last = part_num == self.cache.len();
+
             for (i, part) in self.cache.iter_mut().enumerate() {
-                if first <= i && i <= last {
+                // Retain the given range and also the last part
+                if is_last || (first <= i && i <= last) {
                     // part is in 'retain' range
                     if i == part_idx {
                         // 'buffer' is this part; update it
@@ -224,8 +227,10 @@ impl UploaderPartCache {
         let mut start = 0_u64;
 
         for (i, item) in self.cache.iter().enumerate() {
+            // We can seek to one byte past the end to append
+            let is_last = i == self.cache.len() - 1;
             let item_size: u64 = item.data_size as u64;
-            let range = start..start + item_size;
+            let range = start..start + item_size + if is_last { 1 } else { 0 };
             let part_num = (i + 1) as u16;
 
             if range.contains(&offset) {
@@ -1136,7 +1141,14 @@ impl S3Sink {
         // Determine if new_offset is within the current part or one in the cache.
         let part_start = (started_state.part_number as u64 - 1) * started_state.part_size as u64;
         let part_end = part_start + started_state.buffer.len() as u64;
-        let part_limits = part_start..part_end;
+        // Allow appending to the end of the last part
+        let maybe_one_more =
+            if started_state.part_number as usize == started_state.cache.cache.len() {
+                1
+            } else {
+                0
+            };
+        let part_limits = part_start..(part_end + maybe_one_more);
 
         gst::trace!(
             CAT,
